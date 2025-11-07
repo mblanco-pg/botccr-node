@@ -611,6 +611,8 @@ async function processAudioMessage(message) {
     // no crítico
   }
 
+  console.log('📥 processAudioMessage payload:', JSON.stringify(message, null, 2));
+
   // Extraer id de media según el payload de WhatsApp
   const mediaId = message.audio?.id || message.voice?.id || message?.id || message?.document?.id;
   if (!mediaId) {
@@ -636,9 +638,11 @@ async function processAudioMessage(message) {
     const mediaUrl = mediaMeta.data?.url;
     if (!mediaUrl) throw new Error('Media URL no disponible');
 
-    // 2) Descargar el archivo
-    const mediaResp = await axios.get(mediaUrl, { responseType: 'arraybuffer', timeout: 20000 });
-    const buffer = Buffer.from(mediaResp.data);
+  // 2) Descargar el archivo
+  const mediaResp = await axios.get(mediaUrl, { responseType: 'arraybuffer', timeout: 20000 });
+  console.log('ℹ️ media download headers:', mediaResp.headers || {});
+  const buffer = Buffer.from(mediaResp.data);
+  console.log(`ℹ️ downloaded ${buffer.length} bytes`);
 
     // 3) Guardar en temporal (se borra luego)
     const fs = require('fs');
@@ -646,32 +650,60 @@ async function processAudioMessage(message) {
     const tmpDir = path.join(__dirname, 'tmp');
     if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
 
-    // Intentar deducir extensión por mime si está disponible
-    const ext = '.ogg';
-    const tmpPath = path.join(tmpDir, `${mediaId}${ext}`);
+  // Intentar deducir extensión por mime si está disponible
+  const contentType = (mediaResp.headers['content-type'] || '').toLowerCase();
+  let ext = '.ogg';
+  if (contentType.includes('mpeg') || contentType.includes('mp3')) ext = '.mp3';
+  else if (contentType.includes('wav')) ext = '.wav';
+  else if (contentType.includes('amr')) ext = '.amr';
+  else if (contentType.includes('ogg') || contentType.includes('opus')) ext = '.ogg';
+  const tmpPath = path.join(tmpDir, `${mediaId}${ext}`);
     fs.writeFileSync(tmpPath, buffer);
+  console.log('ℹ️ saved media to', tmpPath);
 
     // 4) Transcribir con OpenAI Whisper si está configurado
-    if (openai && USE_AI) {
+    if (process.env.OPENAI_API_KEY) {
       try {
-        if (openai.audio && typeof openai.audio.transcriptions?.create === 'function') {
+        // Preferir el método del cliente si existe
+        if (openai && openai.audio && typeof openai.audio.transcriptions?.create === 'function') {
+          console.log('ℹ️ usando cliente openai.audio.transcriptions.create');
           const transcription = await openai.audio.transcriptions.create({
             file: fs.createReadStream(tmpPath),
             model: 'whisper-1'
           });
           const text = transcription?.text || transcription?.data?.text || '';
+          console.log('ℹ️ transcription result (client):', text.slice?.(0, 200));
           if (text) {
-            // Reusar flujo de texto: crear un mensaje falso y procesarlo
             const fakeMessage = { text: { body: String(text) }, from };
             await processMessage(fakeMessage);
-            fs.unlinkSync(tmpPath);
+            try { fs.unlinkSync(tmpPath); } catch (e) {}
             return;
           }
         }
+
+        // Fallback: usar la API REST de OpenAI con multipart/form-data
+        console.log('ℹ️ usando fallback REST a OpenAI /audio/transcriptions');
+        const FormData = require('form-data');
+        const form = new FormData();
+        form.append('file', fs.createReadStream(tmpPath));
+        form.append('model', 'whisper-1');
+
+        const headers = Object.assign({ Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, form.getHeaders());
+        const resp = await axios.post('https://api.openai.com/v1/audio/transcriptions', form, { headers, maxContentLength: Infinity, maxBodyLength: Infinity });
+        const text = resp.data?.text || '';
+        console.log('ℹ️ transcription result (REST):', String(text).slice(0, 200));
+        if (text) {
+          const fakeMessage = { text: { body: String(text) }, from };
+          await processMessage(fakeMessage);
+          try { fs.unlinkSync(tmpPath); } catch (e) {}
+          return;
+        }
       } catch (err) {
-        console.error('❌ Error transcribiendo con OpenAI:', err?.message || err);
+        console.error('❌ Error transcribiendo con OpenAI (client/REST):', err.response?.data || err?.message || err);
         // continuar a fallback
       }
+    } else {
+      console.log('⚠️ OPENAI_API_KEY no configurada: no se intentará transcripción');
     }
 
     // 5) Fallback: si no hay transcripción real, avisar al usuario y simular
