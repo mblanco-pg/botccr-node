@@ -11,13 +11,14 @@ const OpenAI = require('openai');
 const app = express();
 app.use(express.json());
 
-// Configurar OpenAI con fetch explícito
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-  fetch: fetch
-});
+// Inicializar OpenAI solo si se proporcionó la API key
+let openai = null;
+if (process.env.OPENAI_API_KEY) {
+  openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: fetch });
+}
 
-const USE_AI = process.env.USE_AI === 'true';
+// Usar IA solo si la variable lo permite y además existe la key
+const USE_AI = (process.env.USE_AI === 'true') && !!process.env.OPENAI_API_KEY;
 
 const GERMAN_PROMPT = `
 PROMPT GERMAN – V2.0
@@ -132,8 +133,8 @@ async function processMessage(message) {
   console.log(`👤 ${from}: ${userMessage}`);
   
   if (!userSessions.has(from)) {
-    userSessions.set(from, []);
-    console.log(`🆕 Nueva sesión para: ${from}`);
+  userSessions.set(from, []);
+  console.log(`🆕 Nueva sesión para: ${from}`);
   }
   
   const userSession = userSessions.get(from);
@@ -195,49 +196,87 @@ function getRuleBasedResponse(conversationHistory) {
     '4) Información institucional'
   ].join('\n');
 
+  // Bienvenida o volver al menú
   if (!hasAssistant || /\bmenu\b/.test(text)) {
     return menu;
   }
 
+  // 1) Tarjetas
   if (/(^|\b)(1|tarjeta|tarjetas|pin|saldo|activaci[oó]n)(\b|$)/.test(text)) {
-    return [
-      'Esta sección aún no cuenta con servicios asociados; replicaré escenarios de conversación.',
-      '- Para activación: envíe últimos 4 dígitos de su tarjeta y su cédula.',
-      '- PIN: solo recordatorio (no cambio) vía canales bancarios.',
-      '¿Desea continuar o volver al menú? (escriba "menu")'
-    ].join('\n');
+    const intents = [];
+    if (/activaci[oó]n|activar/.test(text)) {
+      intents.push(
+        '*Activación de tarjeta*\n' +
+        'Para activar su tarjeta, necesito:\n' +
+        '- Últimos 4 dígitos de la tarjeta\n' +
+        '- Número de cédula registrado\n' +
+        'Ejemplo: "Activación 4578 28987654"'
+      );
+    }
+    if (/pin|recordar/.test(text)) {
+      intents.push(
+        '*PIN (recordatorio)*\n' +
+        'Opciones:\n' +
+        '1) Cajero automático de su banco → "Recordar PIN"\n' +
+        '2) App móvil de su banco → Sección "Tarjetas".\n' +
+        'No podemos mostrar el PIN por este medio.'
+      );
+    }
+    if (/saldo/.test(text)) {
+      intents.push(
+        '*Consulta de saldo*\n' +
+        'Envíe: "Saldo 4578" (últimos 4 dígitos).\n' +
+        'Mostraremos un monto aproximado; para el exacto use cajero o app bancaria.'
+      );
+    }
+    const header = 'Esta sección aún no cuenta con servicios asociados; replicaré escenarios de conversación.';
+    return [header, ...(intents.length ? intents : ['Indique si desea Activación, PIN o Saldo.']), 'Escriba "menu" para volver.'].join('\n');
   }
 
+  // 2) Compra de terminales POS
   if (/(^|\b)(2|pos|punto de venta|terminal)(\b|$)/.test(text)) {
     return [
-      'Compra de POS — Para iniciar, envíe:',
+      'Compra de POS — Para iniciar necesito:',
       '- RIF del comercio',
-      '- Nombre y teléfono de contacto',
-      '- Tipo de POS requerido (móvil/inalámbrico/fijo)',
-      'Luego deberá finalizar en oficina. ¿Desea comenzar o ver menú?'
+      '- Nombre completo y teléfono de contacto',
+      '- Tipo de POS (móvil/inalámbrico/fijo)',
+      'Luego deberá completar el proceso presencialmente: "Visite nuestra oficina para finalizar la compra".',
+      '¿Desea comenzar ahora o ver menú? ("menu")'
     ].join('\n');
   }
 
+  // 3) Soporte técnico
   if (/(^|\b)(3|soporte|t[eé]cnico|falla|reparaci[oó]n)(\b|$)/.test(text)) {
+    const modelHint = /nexgo|newpos|k300|verifone|pax|sunmi/.test(text)
+      ? 'Nota: No mezclo modelos; cada equipo tiene su procedimiento. Si no existe procedimiento para su modelo, se lo indicaré.'
+      : 'Adjunte foto del equipo si puede (solo para identificar el modelo).';
     return [
-      'Soporte técnico — Para abrir ticket, envíe:',
+      'Soporte técnico — Para abrir un ticket, envíe:',
       '- Código de afiliación y número de terminal',
-      '- Marca y modelo/serial',
-      '- Descripción de la falla',
+      '- Marca, modelo y serial del POS',
+      '- Descripción breve de la falla',
       '- Teléfono de contacto',
-      '¿Desea continuar o volver al menú?'
+      modelHint,
+      '¿Desea continuar o volver al menú? ("menu")'
     ].join('\n');
   }
 
+  // 4) Información institucional
   if (/(^|\b)(4|informaci[oó]n|institucional|empresa|credicard)(\b|$)/.test(text)) {
     return [
       'Información institucional — ¿Qué desea saber?',
+      '- ¿Quién es Credicard?',
       '- CredicardPagos (POS virtual)',
-      '- Adquirencia',
-      '- Emisión de tarjetas',
+      '- Adquirencia / Emisión de tarjetas',
+      '- Soluciones tecnofinancieras',
       '- Oficinas y contacto',
-      'Escriba "menu" para volver'
+      'Escriba "menu" para volver.'
     ].join('\n');
+  }
+
+  // Errores / fuera de tema
+  if (/bloqueo|robo|perdida|p[eé]rdida/.test(text)) {
+    return 'Para bloqueos por robo/pérdida, llame de inmediato al 0412-XXX-XXXX (24/7). Por seguridad, no procesamos esta solicitud por chat.';
   }
 
   return 'No identifiqué su solicitud. Elija una opción (1-4) o escriba "menu" para ver opciones.';
@@ -245,50 +284,52 @@ function getRuleBasedResponse(conversationHistory) {
 
 // 4. GENERAR RESPUESTA CON OPENAI
 async function generateAIResponse(conversationHistory, userId) {
-  if (!USE_AI) {
+  // Si IA deshabilitada o no hay cliente de OpenAI, usar respuesta basada en reglas
+  if (!USE_AI || !openai) {
     return getRuleBasedResponse(conversationHistory);
-    };
+  }
+
+  const messages = (Array.isArray(conversationHistory) ? conversationHistory : []).map(m => ({ role: m.role, content: m.content }));
+
+  try {
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: messages,
+      temperature: 0.2,
+      max_tokens: 800
+    });
+
+    const text = resp.choices?.[0]?.message?.content || resp.choices?.[0]?.text || '';
+    return String(text).trim() || getRuleBasedResponse(conversationHistory);
+  } catch (err) {
+    console.error('❌ Error llamando a OpenAI, fallback a reglas:', err?.message || err);
+    return getRuleBasedResponse(conversationHistory);
+  }
 }
 
 // 5. ENVIAR INDICADOR DE "ESCRIBIENDO..."
 async function sendTypingIndicator(to, typing) {
-  const url = `https://graph.facebook.com/v18.0/${process.env.META_PHONE_NUMBER_ID}/messages`;
-  
-  const data = {
-    messaging_product: "whatsapp",
-    to: to,
-    action: {
-      type: typing ? "mark_seen" : "none"
-    }
-  };
-  
-  try {
-    await axios.post(url, data, {
-      headers: {
-        'Authorization': `Bearer ${process.env.META_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      timeout: 5000
-    });
-  } catch (error) {
-    // No crítico, solo logging
-    console.log('⚠️ Error enviando indicador de typing:', error.message);
-  }
+  // Por ahora solo logueamos el indicador para evitar dependencias a Meta si no están configuradas.
+  console.log(`✍️ Indicador de typing para ${to}: ${typing ? 'on' : 'off'}`);
 }
 
 // 6. ENVIAR MENSAJE A WHATSAPP
 async function sendWhatsAppMessage(to, message) {
+  // Si no están configuradas las credenciales de Meta, solo loguear
+  if (!process.env.META_ACCESS_TOKEN || !process.env.META_PHONE_NUMBER_ID) {
+    console.log(`(simulado) Enviar mensaje a ${to}: ${String(message || '').trim()}`);
+    return { simulated: true };
+  }
+
   const url = `https://graph.facebook.com/v18.0/${process.env.META_PHONE_NUMBER_ID}/messages`;
-  
-  // Limpiar y formatear mensaje
-  const cleanMessage = message;
-  
+  const cleanMessage = String(message || '').trim();
+
   const data = {
-    messaging_product: "whatsapp",
+    messaging_product: 'whatsapp',
     to: to,
     text: { body: cleanMessage }
   };
-  
+
   try {
     const response = await axios.post(url, data, {
       headers: {
@@ -297,18 +338,17 @@ async function sendWhatsAppMessage(to, message) {
       },
       timeout: 10000
     });
-    
+
     console.log('✅ Mensaje enviado correctamente');
     return response.data;
-    
+
   } catch (error) {
     console.error('❌ Error enviando mensaje a WhatsApp:', {
       status: error.response?.status,
       data: error.response?.data,
       message: error.message
     });
-    
-    // Re-lanzar error para manejo superior
+
     throw new Error(`WhatsApp API Error: ${error.response?.data?.error?.message || error.message}`);
   }
 }
@@ -320,24 +360,12 @@ app.post('/image/specs', async (req, res) => {
     if (!imageBase64) return res.status(400).json({ error: 'imageBase64 requerido' });
 
     const dataUri = imageBase64.startsWith('data:') ? imageBase64 : `data:image/jpeg;base64,${imageBase64}`;
-    const systemPrompt = 'Eres un extractor de texto experto. Recibirás una imagen codificada en base64 que contiene uno o varios stickers o etiquetas de terminales POS. Tu tarea es extraer todo el texto impreso en la imagen y devolverlo como texto plano, con cada línea tal cual aparece en la imagen, sin JSON ni formato adicional.';
 
-    const resp = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        {
-          role: 'user',
-          content: [
-            { type: 'image_url', image_url: { url: dataUri } }
-          ]
-        }
-      ],
-      temperature: 0
+    // OCR no implementado en este despliegue. Retornamos 501 Not Implemented con instrucción.
+    return res.status(501).json({
+      error: 'not_implemented',
+      message: 'Extracción de texto de imágenes no configurada. Configure un servicio OCR o OpenAI multimodal para habilitar esta ruta.'
     });
-
-    const raw = (resp.choices?.[0]?.message?.content || '');
-    res.json({ data: raw, message: 'Especificaciones extraídas correctamente', status: 'success' });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
