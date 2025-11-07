@@ -567,16 +567,10 @@ async function processImageMessage(message) {
       timeout: 20000
     });
 
+    const buffer = Buffer.from(dlResp.data);
     const contentType = dlResp.headers['content-type'] || 'image/jpeg';
-    const ext = contentType.split('/')?.[1] || 'jpg';
 
-    const tmpDir = path.join(__dirname, 'tmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-
-    const filename = `${mediaId}.${ext}`;
-    const filePath = path.join(tmpDir, filename);
-    fs.writeFileSync(filePath, Buffer.from(dlResp.data));
-    console.log(`💾 Imagen guardada temporalmente en ${filePath}`);
+    console.log(`⬇️ Imagen descargada (${buffer.length} bytes). No se almacenará en disco.`);
 
     // 2) Preparar prompt para OpenAI
     const systemPrompt = GERMAN_PROMPT + '\n\nInstrucción: Analiza la imagen adjunta y extrae la información relevante para el flujo bancario. Responde primero con un resumen breve (máximo 300 caracteres) y luego, si aplicable, entrega un JSON con campos estructurados.';
@@ -585,50 +579,60 @@ async function processImageMessage(message) {
     let extractedText = null;
     if (openai && typeof openai.responses?.create === 'function') {
       try {
-        const form = new FormData();
-        form.append('model', process.env.OPENAI_IMAGE_MODEL || 'gpt-4o-mini-vision');
-        form.append('input', JSON.stringify([
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: 'Por favor, analiza la imagen adjunta y extrae los datos solicitados.' }
-        ]));
-        form.append('file', fs.createReadStream(filePath));
+  // OpenAI Responses API en algunos entornos no acepta multipart/form-data.
+  // Construimos un payload JSON con la imagen embebida en data URL (base64) a partir del buffer en memoria.
+  const imageBase64 = buffer.toString('base64');
+  const dataUrl = `data:${contentType};base64,${imageBase64}`;
 
-        const resp = await axios.post('https://api.openai.com/v1/responses', form, {
+        const payload = {
+          model: process.env.OPENAI_IMAGE_MODEL || 'gpt-4o-mini-vision',
+          input: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: `Por favor, analiza la imagen adjunta y extrae los datos solicitados. Imagen: ${dataUrl}` }
+          ]
+        };
+
+        const resp = await axios.post('https://api.openai.com/v1/responses', payload, {
           headers: {
             Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            ...form.getHeaders()
+            'Content-Type': 'application/json'
           },
-          maxBodyLength: Infinity
+          maxBodyLength: Infinity,
+          timeout: 60000
         });
 
         // Manejar distintas formas de respuesta
         extractedText = resp.data?.output_text || resp.data?.output?.[0]?.content?.[0]?.text || JSON.stringify(resp.data);
       } catch (err) {
-        console.error('❌ Error llamando a OpenAI (vision) via REST:', err?.response?.data || err.message || err);
+        console.error('❌ Error llamando a OpenAI (vision) via REST JSON:', err?.response?.data || err.message || err);
       }
     } else {
       console.log('ℹ️ Cliente OpenAI no disponible o no soporta vision en este entorno — intentando llamada REST directa si OPENAI_API_KEY está presente.');
       if (process.env.OPENAI_API_KEY) {
         try {
-          const form = new FormData();
-          form.append('model', process.env.OPENAI_IMAGE_MODEL || 'gpt-4o-mini-vision');
-          form.append('input', JSON.stringify([
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: 'Por favor, analiza la imagen adjunta y extrae los datos solicitados.' }
-          ]));
-          form.append('file', fs.createReadStream(filePath));
+          const imageBase64 = buffer.toString('base64');
+          const dataUrl = `data:${contentType};base64,${imageBase64}`;
 
-          const resp = await axios.post('https://api.openai.com/v1/responses', form, {
+          const payload = {
+            model: process.env.OPENAI_IMAGE_MODEL || 'gpt-4o-mini-vision',
+            input: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: `Por favor, analiza la imagen adjunta y extrae los datos solicitados. Imagen: ${dataUrl}` }
+            ]
+          };
+
+          const resp = await axios.post('https://api.openai.com/v1/responses', payload, {
             headers: {
               Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-              ...form.getHeaders()
+              'Content-Type': 'application/json'
             },
-            maxBodyLength: Infinity
+            maxBodyLength: Infinity,
+            timeout: 60000
           });
 
           extractedText = resp.data?.output_text || resp.data?.output?.[0]?.content?.[0]?.text || JSON.stringify(resp.data);
         } catch (err) {
-          console.error('❌ Error fallback REST OpenAI (vision):', err?.response?.data || err.message || err);
+          console.error('❌ Error fallback REST OpenAI (vision) JSON:', err?.response?.data || err.message || err);
         }
       }
     }
