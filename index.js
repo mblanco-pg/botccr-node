@@ -7,9 +7,7 @@ const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch
 globalThis.fetch = fetch;
 
 const OpenAI = require('openai');
-const fs = require('fs');
-const path = require('path');
-const FormData = require('form-data');
+const sharp = require('sharp');
 
 const app = express();
 app.use(express.json());
@@ -18,6 +16,105 @@ app.use(express.json());
 let openai = null;
 if (process.env.OPENAI_API_KEY) {
   openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: fetch });
+}
+
+// 10. PROCESAR IMAGENES (sin almacenar en servidor)
+async function processImageMessage(message) {
+  const from = message.from;
+  const imageObj = message.image || {};
+  const mediaId = imageObj.id || imageObj[0]?.id;
+
+  console.log(`🖼️ Imagen recibida de ${from}, mediaId=${mediaId}`);
+
+  if (!userSessions.has(from)) {
+    userSessions.set(from, { messages: [], lastActivity: Date.now(), timeout: null });
+    console.log(`🆕 Nueva sesión (imagen) para: ${from}`);
+  }
+
+  const sessionObj = userSessions.get(from);
+  sessionObj.lastActivity = Date.now();
+  if (sessionObj.messages.length > 12) sessionObj.messages.splice(0, sessionObj.messages.length - 12);
+  scheduleSessionCleanup(from);
+
+  if (!mediaId) {
+    await sendWhatsAppMessage(from, '⚠️ No pude identificar la imagen enviada.');
+    return;
+  }
+
+  try {
+    const token = process.env.META_ACCESS_TOKEN;
+    if (!token) {
+      console.log('⚠️ META_ACCESS_TOKEN no configurado — no se puede descargar media');
+      await sendWhatsAppMessage(from, '⚠️ El servidor no está autorizado para descargar la imagen.');
+      return;
+    }
+
+    // Obtener metadata del media para conseguir la URL
+    const metaResp = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, { params: { access_token: token } });
+    const mediaUrl = metaResp.data?.url || metaResp.data?.file_url || metaResp.data?.uri;
+    if (!mediaUrl) {
+      console.error('❌ No se obtuvo URL del media:', metaResp.data);
+      await sendWhatsAppMessage(from, '⚠️ No pude obtener la URL del archivo enviado.');
+      return;
+    }
+
+    // Descargar en memoria
+    const dlResp = await axios.get(mediaUrl, { responseType: 'arraybuffer', headers: { Authorization: `Bearer ${token}` }, timeout: 20000 });
+    const buffer = Buffer.from(dlResp.data);
+    const contentType = dlResp.headers['content-type'] || 'image/jpeg';
+    console.log(`⬇️ Imagen descargada (${buffer.length} bytes)`);
+
+    // Procesar imagen en memoria (resize/compress)
+    const maxWidth = Number(process.env.IMAGE_MAX_WIDTH) || 1024;
+    const quality = Number(process.env.IMAGE_QUALITY) || 80;
+    let processedBuffer = buffer;
+    try {
+      processedBuffer = await sharp(buffer).resize({ width: maxWidth, withoutEnlargement: true }).jpeg({ quality }).toBuffer();
+      console.log(`🔧 Imagen procesada en memoria: ${buffer.length} -> ${processedBuffer.length} bytes`);
+    } catch (e) {
+      console.warn('⚠️ sharp falló, usando buffer original:', e?.message || e);
+      processedBuffer = buffer;
+    }
+
+    // Construir data URL y llamar a OpenAI Responses vía JSON
+    if (!process.env.OPENAI_API_KEY) {
+      console.log('⚠️ OPENAI_API_KEY no configurado — no se puede procesar la imagen con OpenAI');
+      await sendWhatsAppMessage(from, '⚠️ No está configurada la clave de OpenAI para procesar imágenes.');
+      return;
+    }
+
+    const imageBase64 = processedBuffer.toString('base64');
+    const dataUrl = `data:${contentType};base64,${imageBase64}`;
+    const systemPrompt = GERMAN_PROMPT + '\n\nInstrucción: Analiza la imagen adjunta y extrae la información relevante para el flujo bancario. Responde con un breve resumen y, si aplica, un JSON estructurado.';
+
+    const payload = {
+      model: process.env.OPENAI_IMAGE_MODEL || 'gpt-4o-mini-vision',
+      input: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Analiza la siguiente imagen y extrae la información: ${dataUrl}` }
+      ]
+    };
+
+    const resp = await axios.post('https://api.openai.com/v1/responses', payload, {
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      maxBodyLength: Infinity,
+      timeout: 60000
+    });
+
+    const extractedText = resp.data?.output_text || resp.data?.output?.[0]?.content?.[0]?.text || JSON.stringify(resp.data);
+
+    // Guardar en sesión y enviar mensaje
+    sessionObj.messages.push({ role: 'user', content: '[imagen]'});
+    sessionObj.messages.push({ role: 'assistant', content: extractedText });
+    sessionObj.lastActivity = Date.now();
+    scheduleSessionCleanup(from);
+
+    await sendWhatsAppMessage(from, `🖼️ Resultado de la imagen:\n${String(extractedText).slice(0,1500)}`);
+
+  } catch (err) {
+    console.error('❌ Error procesando imagen:', err?.response?.data || err.message || err);
+    await sendWhatsAppMessage(from, '⚠️ Ocurrió un error al procesar la imagen. Intente nuevamente.');
+  }
 }
 
 // Usar IA solo si la variable lo permite y además existe la key
@@ -458,7 +555,7 @@ app.post('/webhook', async (req, res) => {
       if (message.type === 'text') {
         await processMessage(message);
       } else if (message.type === 'image') {
-        // Nuevo: procesar imágenes con OpenAI (vision) y el prompt del bot
+        // Procesar imagen (se mantiene en memoria, no se escribe a disco)
         await processImageMessage(message);
       } else {
         console.log(`📎 Mensaje de tipo: ${message.type}`);
@@ -515,147 +612,6 @@ async function processMessage(message) {
   } catch (error) {
     console.error('❌ Error procesando mensaje:', error);
     await sendWhatsAppMessage(from, '⚠️ Lo siento, estoy teniendo problemas técnicos. Por favor intenta más tarde.');
-  }
-}
-
-// 10. PROCESAR IMAGENES
-async function processImageMessage(message) {
-  const from = message.from;
-  const imageObj = message.image || {};
-  const mediaId = imageObj.id || imageObj[0]?.id;
-
-  console.log(`🖼️ Imagen recibida de ${from}, mediaId=${mediaId}`);
-
-  if (!userSessions.has(from)) {
-    userSessions.set(from, { messages: [], lastActivity: Date.now(), timeout: null });
-    console.log(`🆕 Nueva sesión (imagen) para: ${from}`);
-  }
-
-  const sessionObj = userSessions.get(from);
-  sessionObj.lastActivity = Date.now();
-  scheduleSessionCleanup(from);
-
-  if (!mediaId) {
-    await sendWhatsAppMessage(from, '⚠️ No pude identificar la imagen enviada.');
-    return;
-  }
-
-  try {
-    // 1) Obtener URL del media desde Graph API
-    const token = process.env.META_ACCESS_TOKEN;
-    if (!token) {
-      console.log('⚠️ META_ACCESS_TOKEN no configurado — simulando extracción de imagen.');
-      await sendWhatsAppMessage(from, '⚠️ No está configurado el acceso a Meta para descargar la imagen.');
-      return;
-    }
-
-    const mediaMetaResp = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, {
-      params: { access_token: token }
-    });
-
-    const mediaUrl = mediaMetaResp.data?.url || mediaMetaResp.data?.file_url || mediaMetaResp.data?.uri;
-    if (!mediaUrl) {
-      console.error('❌ No se obtuvo URL del media:', mediaMetaResp.data);
-      await sendWhatsAppMessage(from, '⚠️ No pude obtener la URL del archivo enviado.');
-      return;
-    }
-
-    console.log(`⬇️ Descargando media desde ${mediaUrl}`);
-    const dlResp = await axios.get(mediaUrl, {
-      responseType: 'arraybuffer',
-      headers: { Authorization: `Bearer ${token}` },
-      timeout: 20000
-    });
-
-    const buffer = Buffer.from(dlResp.data);
-    const contentType = dlResp.headers['content-type'] || 'image/jpeg';
-
-    console.log(`⬇️ Imagen descargada (${buffer.length} bytes). No se almacenará en disco.`);
-
-    // 2) Preparar prompt para OpenAI
-    const systemPrompt = GERMAN_PROMPT + '\n\nInstrucción: Analiza la imagen adjunta y extrae la información relevante para el flujo bancario. Responde primero con un resumen breve (máximo 300 caracteres) y luego, si aplicable, entrega un JSON con campos estructurados.';
-
-    // 3) Intentar usar el cliente oficial si está disponible
-    let extractedText = null;
-    if (openai && typeof openai.responses?.create === 'function') {
-      try {
-  // OpenAI Responses API en algunos entornos no acepta multipart/form-data.
-  // Construimos un payload JSON con la imagen embebida en data URL (base64) a partir del buffer en memoria.
-  const imageBase64 = buffer.toString('base64');
-  const dataUrl = `data:${contentType};base64,${imageBase64}`;
-
-        const payload = {
-          model: process.env.OPENAI_IMAGE_MODEL || 'gpt-4o-mini-vision',
-          input: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: `Por favor, analiza la imagen adjunta y extrae los datos solicitados. Imagen: ${dataUrl}` }
-          ]
-        };
-
-        const resp = await axios.post('https://api.openai.com/v1/responses', payload, {
-          headers: {
-            Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
-          },
-          maxBodyLength: Infinity,
-          timeout: 60000
-        });
-
-        // Manejar distintas formas de respuesta
-        extractedText = resp.data?.output_text || resp.data?.output?.[0]?.content?.[0]?.text || JSON.stringify(resp.data);
-      } catch (err) {
-        console.error('❌ Error llamando a OpenAI (vision) via REST JSON:', err?.response?.data || err.message || err);
-      }
-    } else {
-      console.log('ℹ️ Cliente OpenAI no disponible o no soporta vision en este entorno — intentando llamada REST directa si OPENAI_API_KEY está presente.');
-      if (process.env.OPENAI_API_KEY) {
-        try {
-          const imageBase64 = buffer.toString('base64');
-          const dataUrl = `data:${contentType};base64,${imageBase64}`;
-
-          const payload = {
-            model: process.env.OPENAI_IMAGE_MODEL || 'gpt-4o-mini-vision',
-            input: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: `Por favor, analiza la imagen adjunta y extrae los datos solicitados. Imagen: ${dataUrl}` }
-            ]
-          };
-
-          const resp = await axios.post('https://api.openai.com/v1/responses', payload, {
-            headers: {
-              Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-              'Content-Type': 'application/json'
-            },
-            maxBodyLength: Infinity,
-            timeout: 60000
-          });
-
-          extractedText = resp.data?.output_text || resp.data?.output?.[0]?.content?.[0]?.text || JSON.stringify(resp.data);
-        } catch (err) {
-          console.error('❌ Error fallback REST OpenAI (vision) JSON:', err?.response?.data || err.message || err);
-        }
-      }
-    }
-
-    // 4) Responder al usuario con el resultado (no mostramos "transcribiendo")
-    if (extractedText) {
-      // Añadir a la conversacion
-      sessionObj.messages.push({ role: 'user', content: '[imagen enviada]'});
-      sessionObj.messages.push({ role: 'assistant', content: extractedText });
-      sessionObj.lastActivity = Date.now();
-      scheduleSessionCleanup(from);
-
-      await sendWhatsAppMessage(from, `🖼️ Resultado de la imagen:\n${String(extractedText).slice(0, 1500)}`);
-    } else {
-      await sendWhatsAppMessage(from, '⚠️ No pude extraer información de la imagen en este momento. Intente de nuevo o pruebe con una foto más clara.');
-    }
-
-    // 5) limpieza temporal
-    try { fs.unlinkSync(filePath); } catch (e) { /* noop */ }
-
-  } catch (error) {
-    console.error('❌ Error procesando imagen:', error?.response?.data || error.message || error);
-    await sendWhatsAppMessage(from, '⚠️ Ocurrió un error al procesar la imagen. Intente nuevamente.');
   }
 }
 
