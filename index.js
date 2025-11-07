@@ -484,25 +484,21 @@ async function processImageMessage(message) {
 
     try {
         // 1. Obtener los metadatos y la URL de la imagen
-        const mediaUrlResponse = await axios.get(
-            `${WHATSAPP_API_URL}${mediaId}`,
-            {
-                headers: { 
-                    'Authorization': `Bearer ${process.env.API_TOKEN}` // ¡Tu token de API!
-                }
-            }
-        );
+    // Use the configured META_ACCESS_TOKEN (WhatsApp Cloud API token)
+    if (!process.env.META_ACCESS_TOKEN) throw new Error('META_ACCESS_TOKEN not configured');
+    const mediaUrlResponse = await axios.get(`${WHATSAPP_API_URL}${mediaId}`, {
+      params: { access_token: process.env.META_ACCESS_TOKEN }
+    });
         const downloadUrl = mediaUrlResponse.data.url;
         
         console.log(`URL de descarga obtenida: ${downloadUrl}`);
 
         // 2. Descargar el contenido binario (la imagen)
-        const imageResponse = await axios.get(downloadUrl, {
-            headers: {
-                'Authorization': `Bearer ${process.env.API_TOKEN}`
-            },
-            responseType: 'arraybuffer' // Importante para manejar archivos binarios
-        });
+    // Descargar la imagen. La URL devuelta por la API suele requerir el mismo token en headers.
+    const imageResponse = await axios.get(downloadUrl, {
+      responseType: 'arraybuffer', // Importante para manejar archivos binarios
+      headers: { Authorization: `Bearer ${process.env.META_ACCESS_TOKEN}` }
+    });
 
         const imageBuffer = imageResponse.data;
         const mimeType = mediaUrlResponse.data.mime_type;
