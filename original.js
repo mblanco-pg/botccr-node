@@ -422,15 +422,12 @@ app.post('/webhook', async (req, res) => {
     // Verificar si es un mensaje
     if (changes.value.messages && changes.value.messages.length > 0) {
       const message = changes.value.messages[0];
-
+      
       if (message.type === 'text') {
         await processMessage(message);
-      } else if (['audio', 'voice', 'ptt'].includes(message.type)) {
-        // Manejo de audios/voice notes
-        await processAudioMessage(message);
       } else {
         console.log(`📎 Mensaje de tipo: ${message.type}`);
-        await sendWhatsAppMessage(message.from, '🤖 Por ahora solo puedo procesar mensajes de texto y notas de voz.');
+        await sendWhatsAppMessage(message.from, '🤖 Por ahora solo puedo procesar mensajes de texto.');
       }
     } else {
       console.log('📢 Evento de webhook (no mensaje):', changes.value.statuses ? 'status' : 'other');
@@ -599,83 +596,6 @@ function getRuleBasedResponse(conversationHistory) {
 
   return 'No identifiqué su solicitud. Elija una opción (1-4) o escriba "menu" para ver opciones.';
 }
-
-//  -- PROCESAMIENTO DE AUDIOS
-async function processAudioMessage(message) {
-  const from = message.from;
-
-  // Avisar al usuario que estamos procesando (simulado)
-  try {
-    await sendWhatsAppMessage(from, '🎧 Gracias por su audio. Estoy transcribiendo...');
-  } catch (e) {
-    // no crítico
-  }
-
-  // Extraer id de media según el payload de WhatsApp
-  const mediaId = message.audio?.id || message.voice?.id || message?.id || message?.document?.id;
-  if (!mediaId) {
-    await sendWhatsAppMessage(from, 'No pude obtener el audio. Por favor reintente o envíe texto.');
-    return;
-  }
-
-  try {
-    // 1) Obtener la url del media desde la Graph API
-    const mediaMeta = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, {
-      params: { access_token: process.env.META_ACCESS_TOKEN }
-    });
-
-    const mediaUrl = mediaMeta.data?.url;
-    if (!mediaUrl) throw new Error('Media URL no disponible');
-
-    // 2) Descargar el archivo
-    const mediaResp = await axios.get(mediaUrl, { responseType: 'arraybuffer', timeout: 20000 });
-    const buffer = Buffer.from(mediaResp.data);
-
-    // 3) Guardar en temporal (se borra luego)
-    const fs = require('fs');
-    const path = require('path');
-    const tmpDir = path.join(__dirname, 'tmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-
-    // Intentar deducir extensión por mime si está disponible
-    const ext = '.ogg';
-    const tmpPath = path.join(tmpDir, `${mediaId}${ext}`);
-    fs.writeFileSync(tmpPath, buffer);
-
-    // 4) Transcribir con OpenAI Whisper si está configurado
-    if (openai && USE_AI) {
-      try {
-        if (openai.audio && typeof openai.audio.transcriptions?.create === 'function') {
-          const transcription = await openai.audio.transcriptions.create({
-            file: fs.createReadStream(tmpPath),
-            model: 'whisper-1'
-          });
-          const text = transcription?.text || transcription?.data?.text || '';
-          if (text) {
-            // Reusar flujo de texto: crear un mensaje falso y procesarlo
-            const fakeMessage = { text: { body: String(text) }, from };
-            await processMessage(fakeMessage);
-            fs.unlinkSync(tmpPath);
-            return;
-          }
-        }
-      } catch (err) {
-        console.error('❌ Error transcribiendo con OpenAI:', err?.message || err);
-        // continuar a fallback
-      }
-    }
-
-    // 5) Fallback: si no hay transcripción real, avisar al usuario y simular
-    await sendWhatsAppMessage(from, 'Lo siento, la transcripción automática no está disponible en este momento. Por favor, escriba su mensaje o intente nuevamente.');
-
-    // Limpieza temporal
-    try { fs.unlinkSync(tmpPath); } catch (e) { /* ignore */ }
-  } catch (err) {
-    console.error('❌ Error procesando audio:', err?.message || err);
-    await sendWhatsAppMessage(from, 'No pude procesar su audio. Intente con un audio más corto o envíe texto.');
-  }
-}
-
 
 // 4. GENERAR RESPUESTA CON OPENAI
 async function generateAIResponse(conversationHistory, userId) {
