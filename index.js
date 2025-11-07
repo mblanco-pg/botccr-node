@@ -9,6 +9,9 @@ globalThis.fetch = fetch;
 const OpenAI = require('openai');
 const { toFile } = require('openai/uploads');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const FormData = require('form-data');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
 
 const app = express();
 app.use(express.json());
@@ -572,6 +575,55 @@ app.get('/health', (req, res) => {
     memory: process.memoryUsage(),
     uptime: process.uptime()
   });
+});
+
+app.post('/openai/files', upload.single('file'), async (req, res) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'OPENAI_API_KEY not configured' });
+    if (!req.file) return res.status(400).json({ error: 'file is required (form field name: file)' });
+
+    const form = new FormData();
+    form.append('purpose', 'assistants');
+    form.append('file', req.file.buffer, {
+      filename: req.file.originalname || 'upload.bin',
+      contentType: req.file.mimetype || 'application/octet-stream'
+    });
+
+    const resp = await axios.post('https://api.openai.com/v1/files', form, {
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, ...form.getHeaders() },
+      maxBodyLength: Infinity,
+      timeout: 60000
+    });
+
+    res.json(resp.data);
+  } catch (err) {
+    res.status(500).json({ error: 'upload_failed', detail: err?.response?.data || err.message });
+  }
+});
+
+app.post('/openai/chat-with-file', async (req, res) => {
+  try {
+    if (!process.env.OPENAI_API_KEY) return res.status(400).json({ error: 'OPENAI_API_KEY not configured' });
+    const { file_ids, message, model } = req.body || {};
+    if (!file_ids || !Array.isArray(file_ids) || file_ids.length === 0) return res.status(400).json({ error: 'file_ids (array) is required' });
+
+    const payload = {
+      model: model || process.env.OPENAI_CHAT_MODEL || 'gpt-4o',
+      messages: [ { role: 'user', content: message || 'Por favor, resume el contenido del archivo adjunto.' } ],
+      file_ids,
+      tools: [ { type: 'file_search' } ],
+      tool_choice: 'auto'
+    };
+
+    const resp = await axios.post('https://api.openai.com/v1/chat/completions', payload, {
+      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      timeout: 60000
+    });
+
+    res.json(resp.data);
+  } catch (err) {
+    res.status(500).json({ error: 'chat_failed', detail: err?.response?.data || err.message });
+  }
 });
 
 // 8. MANEJO DE ERRORES GLOBAL
