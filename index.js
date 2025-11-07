@@ -588,6 +588,7 @@ app.post('/openai/files', upload.single('file'), async (req, res) => {
       filename: req.file.originalname || 'upload.bin',
       contentType: req.file.mimetype || 'application/octet-stream'
     });
+    
 
     const resp = await axios.post('https://api.openai.com/v1/files', form, {
       headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY}`, ...form.getHeaders() },
