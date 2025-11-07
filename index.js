@@ -384,19 +384,31 @@ Su mensaje fue muy breve. ¿Podría ampliar la información?
 // Cada entrada: userId => { messages: Array, lastActivity: number, timeout: Timeout }
 const userSessions = new Map();
 
-// Tiempo de expiración de sesión (ms). Por defecto 15 minutos.
-const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS) || 15 * 60 * 1000;
+// Tiempo de expiración de sesión (ms). Por defecto 5 minutos.
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS) || 5 * 60 * 1000;
 
 function scheduleSessionCleanup(userId) {
   const session = userSessions.get(userId);
   if (!session) return;
-  // limpiar timeout previo
-  if (session.timeout) {
-    clearTimeout(session.timeout);
-  }
-  session.timeout = setTimeout(() => {
-    console.log(`🗑️ Sesión expirada para ${userId} por inactividad (${SESSION_TTL_MS}ms)`);
-    userSessions.delete(userId);
+  if (session.timeout) clearTimeout(session.timeout);
+
+  session.timeout = setTimeout(async () => {
+    try {
+      console.log(`⏰ Sesión inactiva para ${userId}. Enviando aviso de expiración.`);
+      await sendWhatsAppMessage(userId, '⚠️ Su sesión ha estado inactiva. Esta sesión cerrará en breve por inactividad.');
+    } catch (e) {
+      console.error('⚠️ Error enviando aviso de expiración:', e?.message || e);
+    }
+
+    // Cerrar sesión 3s después del aviso
+    setTimeout(() => {
+      const s = userSessions.get(userId);
+      if (s && s.timeout) clearTimeout(s.timeout);
+      if (userSessions.has(userId)) {
+        userSessions.delete(userId);
+        console.log(`🗑️ Sesión cerrada para ${userId} tras aviso de expiración.`);
+      }
+    }, 3000);
   }, SESSION_TTL_MS);
 }
 
@@ -439,15 +451,12 @@ app.post('/webhook', async (req, res) => {
     // Verificar si es un mensaje
     if (changes.value.messages && changes.value.messages.length > 0) {
       const message = changes.value.messages[0];
-
+      
       if (message.type === 'text') {
         await processMessage(message);
-      } else if (['audio', 'voice', 'ptt'].includes(message.type)) {
-        // Manejo de audios/voice notes
-        await processAudioMessage(message);
       } else {
         console.log(`📎 Mensaje de tipo: ${message.type}`);
-        await sendWhatsAppMessage(message.from, '🤖 Por ahora solo puedo procesar mensajes de texto y notas de voz.');
+        await sendWhatsAppMessage(message.from, '🤖 Por ahora solo puedo procesar mensajes de texto.');
       }
     } else {
       console.log('📢 Evento de webhook (no mensaje):', changes.value.statuses ? 'status' : 'other');
@@ -475,17 +484,15 @@ async function processMessage(message) {
   const sessionObj = userSessions.get(from);
   sessionObj.messages.push({ role: "user", content: userMessage });
   sessionObj.lastActivity = Date.now();
-  // limitar historial
   if (sessionObj.messages.length > 12) {
     sessionObj.messages.splice(0, sessionObj.messages.length - 12);
   }
-  // (re)programar limpieza por inactividad
   scheduleSessionCleanup(from);
   
   try {
     await sendTypingIndicator(from, true);
 
-    const aiResponse = await generateAIResponse(userSession, from);
+    const aiResponse = await generateAIResponse(sessionObj.messages, from);
 
     await sendTypingIndicator(from, false);
 
@@ -496,7 +503,6 @@ async function processMessage(message) {
     await sendWhatsAppMessage(from, aiResponse);
 
     if (isSessionEnded(sessionObj.messages)) {
-      // cerrar sesión inmediatamente
       if (sessionObj.timeout) clearTimeout(sessionObj.timeout);
       userSessions.delete(from);
     }
@@ -622,124 +628,6 @@ function getRuleBasedResponse(conversationHistory) {
 
   return 'No identifiqué su solicitud. Elija una opción (1-4) o escriba "menu" para ver opciones.';
 }
-
-//  -- PROCESAMIENTO DE AUDIOS
-async function processAudioMessage(message) {
-  const from = message.from;
-
-  // Avisar al usuario que estamos procesando (simulado)
-  try {
-    await sendWhatsAppMessage(from, '🎧 Gracias por su audio. Estoy transcribiendo...');
-  } catch (e) {
-    // no crítico
-  }
-
-  console.log('📥 processAudioMessage payload:', JSON.stringify(message, null, 2));
-
-  // Extraer id de media según el payload de WhatsApp
-  const mediaId = message.audio?.id || message.voice?.id || message?.id || message?.document?.id;
-  if (!mediaId) {
-    await sendWhatsAppMessage(from, 'No pude obtener el audio. Por favor reintente o envíe texto.');
-    return;
-  }
-
-  try {
-    // Validar que exista token de Meta para descargar media
-    if (!process.env.META_ACCESS_TOKEN) {
-      console.error('❌ META_ACCESS_TOKEN no configurado, imposible descargar media');
-      await sendWhatsAppMessage(from, 'No está configurada la variable META_ACCESS_TOKEN en el servidor, por lo que no puedo descargar el audio. Configurela o envíe texto.');
-      return;
-    }
-
-    // 1) Obtener la url del media desde la Graph API
-    const mediaMeta = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, {
-      params: { access_token: process.env.META_ACCESS_TOKEN }
-    });
-
-    console.log('ℹ️ mediaMeta:', mediaMeta.data);
-
-    const mediaUrl = mediaMeta.data?.url;
-    if (!mediaUrl) throw new Error('Media URL no disponible');
-
-  // 2) Descargar el archivo
-  const mediaResp = await axios.get(mediaUrl, { responseType: 'arraybuffer', timeout: 20000 });
-  console.log('ℹ️ media download headers:', mediaResp.headers || {});
-  const buffer = Buffer.from(mediaResp.data);
-  console.log(`ℹ️ downloaded ${buffer.length} bytes`);
-
-    // 3) Guardar en temporal (se borra luego)
-    const fs = require('fs');
-    const path = require('path');
-    const tmpDir = path.join(__dirname, 'tmp');
-    if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir, { recursive: true });
-
-  // Intentar deducir extensión por mime si está disponible
-  const contentType = (mediaResp.headers['content-type'] || '').toLowerCase();
-  let ext = '.ogg';
-  if (contentType.includes('mpeg') || contentType.includes('mp3')) ext = '.mp3';
-  else if (contentType.includes('wav')) ext = '.wav';
-  else if (contentType.includes('amr')) ext = '.amr';
-  else if (contentType.includes('ogg') || contentType.includes('opus')) ext = '.ogg';
-  const tmpPath = path.join(tmpDir, `${mediaId}${ext}`);
-    fs.writeFileSync(tmpPath, buffer);
-  console.log('ℹ️ saved media to', tmpPath);
-
-    // 4) Transcribir con OpenAI Whisper si está configurado
-    if (process.env.OPENAI_API_KEY) {
-      try {
-        // Preferir el método del cliente si existe
-        if (openai && openai.audio && typeof openai.audio.transcriptions?.create === 'function') {
-          console.log('ℹ️ usando cliente openai.audio.transcriptions.create');
-          const transcription = await openai.audio.transcriptions.create({
-            file: fs.createReadStream(tmpPath),
-            model: 'whisper-1'
-          });
-          const text = transcription?.text || transcription?.data?.text || '';
-          console.log('ℹ️ transcription result (client):', text.slice?.(0, 200));
-          if (text) {
-            const fakeMessage = { text: { body: String(text) }, from };
-            await processMessage(fakeMessage);
-            try { fs.unlinkSync(tmpPath); } catch (e) {}
-            return;
-          }
-        }
-
-        // Fallback: usar la API REST de OpenAI con multipart/form-data
-        console.log('ℹ️ usando fallback REST a OpenAI /audio/transcriptions');
-        const FormData = require('form-data');
-        const form = new FormData();
-        form.append('file', fs.createReadStream(tmpPath));
-        form.append('model', 'whisper-1');
-
-        const headers = Object.assign({ Authorization: `Bearer ${process.env.OPENAI_API_KEY}` }, form.getHeaders());
-        const resp = await axios.post('https://api.openai.com/v1/audio/transcriptions', form, { headers, maxContentLength: Infinity, maxBodyLength: Infinity });
-        const text = resp.data?.text || '';
-        console.log('ℹ️ transcription result (REST):', String(text).slice(0, 200));
-        if (text) {
-          const fakeMessage = { text: { body: String(text) }, from };
-          await processMessage(fakeMessage);
-          try { fs.unlinkSync(tmpPath); } catch (e) {}
-          return;
-        }
-      } catch (err) {
-        console.error('❌ Error transcribiendo con OpenAI (client/REST):', err.response?.data || err?.message || err);
-        // continuar a fallback
-      }
-    } else {
-      console.log('⚠️ OPENAI_API_KEY no configurada: no se intentará transcripción');
-    }
-
-    // 5) Fallback: si no hay transcripción real, avisar al usuario y simular
-    await sendWhatsAppMessage(from, 'Lo siento, la transcripción automática no está disponible en este momento. Por favor, escriba su mensaje o intente nuevamente.');
-
-    // Limpieza temporal
-    try { fs.unlinkSync(tmpPath); } catch (e) { /* ignore */ }
-  } catch (err) {
-    console.error('❌ Error procesando audio:', err?.message || err);
-    await sendWhatsAppMessage(from, 'No pude procesar su audio. Intente con un audio más corto o envíe texto.');
-  }
-}
-
 
 // 4. GENERAR RESPUESTA CON OPENAI
 async function generateAIResponse(conversationHistory, userId) {
