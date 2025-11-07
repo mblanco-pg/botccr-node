@@ -381,7 +381,24 @@ Su mensaje fue muy breve. ¿Podría ampliar la información?
 `;
 
 // Almacenamiento en memoria mejorado
+// Cada entrada: userId => { messages: Array, lastActivity: number, timeout: Timeout }
 const userSessions = new Map();
+
+// Tiempo de expiración de sesión (ms). Por defecto 15 minutos.
+const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS) || 15 * 60 * 1000;
+
+function scheduleSessionCleanup(userId) {
+  const session = userSessions.get(userId);
+  if (!session) return;
+  // limpiar timeout previo
+  if (session.timeout) {
+    clearTimeout(session.timeout);
+  }
+  session.timeout = setTimeout(() => {
+    console.log(`🗑️ Sesión expirada para ${userId} por inactividad (${SESSION_TTL_MS}ms)`);
+    userSessions.delete(userId);
+  }, SESSION_TTL_MS);
+}
 
 // Middleware para logs
 app.use((req, res, next) => {
@@ -451,17 +468,19 @@ async function processMessage(message) {
   console.log(`👤 ${from}: ${userMessage}`);
   
   if (!userSessions.has(from)) {
-  userSessions.set(from, []);
-  console.log(`🆕 Nueva sesión para: ${from}`);
+    userSessions.set(from, { messages: [], lastActivity: Date.now(), timeout: null });
+    console.log(`🆕 Nueva sesión para: ${from}`);
   }
-  
-  const userSession = userSessions.get(from);
-  
-  userSession.push({ role: "user", content: userMessage });
-  
-  if (userSession.length > 12) {
-    userSession.splice(0, userSession.length - 12);
+
+  const sessionObj = userSessions.get(from);
+  sessionObj.messages.push({ role: "user", content: userMessage });
+  sessionObj.lastActivity = Date.now();
+  // limitar historial
+  if (sessionObj.messages.length > 12) {
+    sessionObj.messages.splice(0, sessionObj.messages.length - 12);
   }
+  // (re)programar limpieza por inactividad
+  scheduleSessionCleanup(from);
   
   try {
     await sendTypingIndicator(from, true);
@@ -470,11 +489,15 @@ async function processMessage(message) {
 
     await sendTypingIndicator(from, false);
 
-    userSession.push({ role: "assistant", content: aiResponse });
+    sessionObj.messages.push({ role: "assistant", content: aiResponse });
+    sessionObj.lastActivity = Date.now();
+    scheduleSessionCleanup(from);
 
     await sendWhatsAppMessage(from, aiResponse);
 
-    if (isSessionEnded(userSession)) {
+    if (isSessionEnded(sessionObj.messages)) {
+      // cerrar sesión inmediatamente
+      if (sessionObj.timeout) clearTimeout(sessionObj.timeout);
       userSessions.delete(from);
     }
   } catch (error) {
@@ -815,8 +838,8 @@ app.get('/', (req, res) => {
     users_activos: userSessions.size,
     sesiones_totales: Array.from(userSessions.entries()).map(([id, session]) => ({
       usuario: id,
-      mensajes: session.length,
-      ultima_interaccion: new Date().toISOString()
+      mensajes: session.messages?.length || 0,
+      ultima_interaccion: new Date(session.lastActivity || Date.now()).toISOString()
     })),
     timestamp: new Date().toISOString()
   });
@@ -825,11 +848,12 @@ app.get('/', (req, res) => {
 // Limpiar sesiones
 app.delete('/sessions', (req, res) => {
   const previousSize = userSessions.size;
+  // limpiar timeouts
+  for (const [, session] of userSessions.entries()) {
+    if (session.timeout) clearTimeout(session.timeout);
+  }
   userSessions.clear();
-  res.json({
-    message: 'Sesiones limpiadas',
-    sesiones_eliminadas: previousSize
-  });
+  res.json({ message: 'Sesiones limpiadas', sesiones_eliminadas: previousSize });
 });
 
 // Health check
