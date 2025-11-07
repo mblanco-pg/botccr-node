@@ -200,12 +200,12 @@ async function handleAudioMessage(message) {
     } catch (err) {
       console.log('⚠️ Falló flujo OpenAI, usando Gemini como respaldo:', err.message);
       const transcript = await transcribeWithGemini(download.buffer, mimeType);
-      finalText = (transcript || '').trim();
+      finalText = (transcript || '')
     }
 
     await sendTypingIndicator(from, false);
 
-    const clean = (finalText || '').trim();
+    const clean = (finalText || '');
     if (!clean) {
       return sendWhatsAppMessage(from, '⚠️ No pude transcribir el audio. ¿Puedes intentarlo de nuevo?');
     }
@@ -247,7 +247,7 @@ async function handleImageMessage(message) {
 
     await sendTypingIndicator(from, false);
 
-    const clean = (analysis || '').trim();
+    const clean = (analysis || '');
     if (!clean) {
       return sendWhatsAppMessage(from, '⚠️ No pude analizar la imagen. ¿Puedes intentarlo de nuevo?');
     }
@@ -477,7 +477,7 @@ async function sendWhatsAppMessage(to, message) {
   const url = `https://graph.facebook.com/v18.0/${process.env.META_PHONE_NUMBER_ID}/messages`;
   
   // Limpiar y formatear mensaje
-  const cleanMessage = message.trim();
+  const cleanMessage = message;
   
   const data = {
     messaging_product: "whatsapp",
@@ -532,7 +532,7 @@ app.post('/image/specs', async (req, res) => {
       temperature: 0
     });
 
-    const raw = (resp.choices?.[0]?.message?.content || '').trim();
+    const raw = (resp.choices?.[0]?.message?.content || '');
     res.json({ data: raw, message: 'Especificaciones extraídas correctamente', status: 'success' });
   } catch (e) {
     res.status(500).json({ error: String(e) });
