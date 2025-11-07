@@ -619,10 +619,19 @@ async function processAudioMessage(message) {
   }
 
   try {
+    // Validar que exista token de Meta para descargar media
+    if (!process.env.META_ACCESS_TOKEN) {
+      console.error('❌ META_ACCESS_TOKEN no configurado, imposible descargar media');
+      await sendWhatsAppMessage(from, 'No está configurada la variable META_ACCESS_TOKEN en el servidor, por lo que no puedo descargar el audio. Configurela o envíe texto.');
+      return;
+    }
+
     // 1) Obtener la url del media desde la Graph API
     const mediaMeta = await axios.get(`https://graph.facebook.com/v18.0/${mediaId}`, {
       params: { access_token: process.env.META_ACCESS_TOKEN }
     });
+
+    console.log('ℹ️ mediaMeta:', mediaMeta.data);
 
     const mediaUrl = mediaMeta.data?.url;
     if (!mediaUrl) throw new Error('Media URL no disponible');
